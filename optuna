@@ -1,0 +1,494 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import weibull_min
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
+import optuna
+import warnings
+warnings.filterwarnings("ignore")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+###########################################################
+# EXACT COLUMN NAMES FROM YOUR IMAGE
+###########################################################
+
+IMPRESSION_COLS = [
+    "Digital Video_impressions",
+    "DirectMail_impressions",
+    "PaidSearch_impressions",
+    "Sponsorship_impressions",
+    "Streaming_impressions",
+    "YouTube_impressions",
+]
+
+SPEND_COLS = [
+    "Digital Radio_spend",
+    "Display_spend",
+    "Flipp_spend",
+    "Meta_spend",
+    "Newspaper_spend",
+    "OOH_spend",
+    "POP_spend",
+    "Pinterest_spend",
+    "Radio_spend",
+    "TV_spend",
+]
+
+ALL_MEDIA_COLS = IMPRESSION_COLS + SPEND_COLS
+
+# These came from your Step 3 deseasonalization
+# Replace with your actual flagged channels
+DESEASONED_COLS = [
+    f"{col}_deseas"
+    for col in CHANNELS_TO_DESEASON
+    if f"{col}_deseas" in df.columns
+]
+
+# Final media input — deseasoned where needed, raw otherwise
+FINAL_MEDIA_COLS = []
+for col in ALL_MEDIA_COLS:
+    deseas = f"{col}_deseas"
+    if deseas in df.columns:
+        FINAL_MEDIA_COLS.append(deseas)
+    else:
+        FINAL_MEDIA_COLS.append(col)
+
+print("Media columns going into model:")
+for col in FINAL_MEDIA_COLS:
+    tag = "← deseasoned" if "_deseas" in col else "← raw"
+    print(f"  {col:45s} {tag}")
+
+###########################################################
+# CONTROL COLUMNS
+# Everything that is NOT media
+###########################################################
+
+CONTROL_COLS = [
+    # Weather
+    "temp_high",
+    "temp_low",
+    "precipitation",
+    "humidity",
+    "gas_price",
+
+    # Store operations
+    "new_stores_openings",
+    "store_closures",
+    "remodels_in_progress",
+
+    # Promotions
+    "discount_amount",
+    "promotion_intensity",
+
+    # Trend
+    "t",
+
+    # Fourier seasonality
+    "sin_1", "cos_1",
+    "sin_2", "cos_2",
+    "sin_3", "cos_3",
+    "sin_4", "cos_4",
+]
+
+# Event stage indicators (pre/on/post)
+# Built in earlier step
+EVENT_STAGE_COLS = []
+for event in ["thanksgiving", "christmas", "newyear",
+              "valentine", "mothers_day", "memorial_day",
+              "blackfriday", "easter"]:
+    for stage in ["_pre", "_on", "_post"]:
+        col = f"{event}{stage}"
+        if col in df.columns:
+            EVENT_STAGE_COLS.append(col)
+
+ALL_CONTROL_COLS = CONTROL_COLS + EVENT_STAGE_COLS
+
+print(f"\nControl columns: {len(ALL_CONTROL_COLS)}")
+print(f"Event stage columns: {len(EVENT_STAGE_COLS)}")
+
+###########################################################
+# FILL MISSING VALUES IN MEDIA COLUMNS WITH ZERO
+###########################################################
+
+print("\nFilling missing values:")
+for col in FINAL_MEDIA_COLS:
+    if col in df.columns:
+        missing = df[col].isna().sum()
+        if missing > 0:
+            df[col] = df[col].fillna(0)
+            print(f"  {col}: filled {missing} nulls with 0")
+
+###########################################################
+# ADSTOCK FUNCTIONS
+###########################################################
+
+def geometric_adstock(x, decay, max_lag=26):
+    """
+    Simple exponential decay
+    weight[lag] = decay^lag
+    decay close to 1 = long memory
+    decay close to 0 = fast decay
+    """
+    weights = np.array([decay**i for i in range(max_lag)])
+    weights = weights / weights.sum()
+    return np.convolve(x, weights, mode="full")[:len(x)]
+
+
+def weibull_adstock(x, shape, scale, max_lag=26):
+    """
+    Flexible decay — can peak after lag 0
+    shape > 1 = delayed peak effect
+    shape < 1 = instant peak then slow decay
+    """
+    lags    = np.arange(max_lag)
+    weights = weibull_min.pdf(lags + 1, c=shape, scale=scale)
+    if weights.sum() == 0:
+        return x
+    weights = weights / weights.sum()
+    return np.convolve(x, weights, mode="full")[:len(x)]
+
+
+def apply_adstock(x, adstock_type, params):
+    """
+    Applies correct adstock based on type
+    """
+    if adstock_type == "geometric":
+        return geometric_adstock(
+            x,
+            decay   = params["decay"],
+            max_lag = 26
+        )
+    else:  # weibull
+        return weibull_adstock(
+            x,
+            shape   = params["shape"],
+            scale   = params["scale"],
+            max_lag = 26
+        )
+
+
+def hill_transform(x, alpha, k):
+    """
+    Saturation curve — zero preserving
+    Output always between 0 and 1
+    """
+    x = np.clip(x, 0, None)
+    return np.where(
+        x == 0,
+        0,
+        x**alpha / (x**alpha + k**alpha + 1e-8)
+    )
+
+###########################################################
+# FEATURE BUILDER
+###########################################################
+
+def build_feature_matrix(data, media_cols, params):
+    """
+    For each media channel:
+      1. Apply adstock (geometric or weibull)
+      2. Apply Hill saturation
+    Then add all control variables
+    Returns complete feature matrix
+    """
+    features = {}
+
+    for col in media_cols:
+        if col not in data.columns:
+            continue
+
+        series = data[col].fillna(0).values
+
+        # Get this channel's params
+        adstock_type = params[f"{col}_adstock_type"]
+
+        adstock_params = {}
+        if adstock_type == "geometric":
+            adstock_params["decay"] = params[f"{col}_decay"]
+        else:
+            adstock_params["shape"] = params[f"{col}_shape"]
+            adstock_params["scale"] = params[f"{col}_scale"]
+
+        alpha = params[f"{col}_alpha"]
+        k     = params[f"{col}_k"]
+
+        # Step 1 — Adstock
+        adstocked = apply_adstock(series, adstock_type, adstock_params)
+
+        # Step 2 — Hill saturation
+        transformed = hill_transform(adstocked, alpha, k)
+
+        features[col] = transformed
+
+    # Add control variables
+    for col in ALL_CONTROL_COLS:
+        if col in data.columns:
+            features[col] = data[col].fillna(0).values
+
+    return pd.DataFrame(features)
+
+###########################################################
+# OPTUNA OBJECTIVE FUNCTION
+# Searches for best adstock type + params per channel
+# Optimizes ridge alpha too
+# Evaluated on OOS R²
+###########################################################
+
+def build_objective(train_data, test_data, media_cols):
+
+    def objective(trial):
+
+        params = {}
+
+        for col in media_cols:
+            if col not in train_data.columns:
+                continue
+
+            # Let Optuna choose adstock type
+            adstock_type = trial.suggest_categorical(
+                f"{col}_adstock_type",
+                ["geometric", "weibull"]
+            )
+            params[f"{col}_adstock_type"] = adstock_type
+
+            if adstock_type == "geometric":
+                params[f"{col}_decay"] = trial.suggest_float(
+                    f"{col}_decay", 0.1, 0.95
+                )
+            else:
+                params[f"{col}_shape"] = trial.suggest_float(
+                    f"{col}_shape", 0.5, 5.0
+                )
+                params[f"{col}_scale"] = trial.suggest_float(
+                    f"{col}_scale", 1.0, 15.0
+                )
+
+            # Hill parameters for all channels
+            params[f"{col}_alpha"] = trial.suggest_float(
+                f"{col}_alpha", 0.5, 3.0
+            )
+            params[f"{col}_k"] = trial.suggest_float(
+                f"{col}_k", 
+                # k should be within observed spend range
+                train_data[col].quantile(0.1) + 1,
+                train_data[col].quantile(0.9) + 1
+            )
+
+        # Ridge alpha also optimized
+        ridge_alpha = trial.suggest_float(
+            "ridge_alpha", 0.01, 100.0, log=True
+        )
+
+        # Build features
+        X_train = build_feature_matrix(train_data, media_cols, params)
+        X_test  = build_feature_matrix(test_data,  media_cols, params)
+
+        # Align columns
+        for col in X_train.columns:
+            if col not in X_test.columns:
+                X_test[col] = 0.0
+        X_test = X_test[X_train.columns]
+
+        # Handle any remaining nulls
+        X_train = X_train.fillna(0)
+        X_test  = X_test.fillna(0)
+
+        # Scale
+        scaler   = StandardScaler()
+        Xs_train = scaler.fit_transform(X_train)
+        Xs_test  = scaler.transform(X_test)
+
+        y_train  = train_data["sales_amount"].fillna(0).values
+        y_test   = test_data["sales_amount"].fillna(0).values
+
+        # Ridge — positive=True enforces positive ROAS
+        model = Ridge(alpha=ridge_alpha, positive=True)
+        model.fit(Xs_train, y_train)
+
+        preds = model.predict(Xs_test)
+        score = r2_score(y_test, preds)
+
+        return score
+
+    return objective
+
+###########################################################
+# RUN OPTUNA PER DMA
+###########################################################
+
+df["Week_Start"] = pd.to_datetime(df["Week_Start"])
+df = df.sort_values(["dma", "department", "Week_Start"]).reset_index(drop=True)
+
+# Add trend variable
+df["t"] = df.groupby(["dma", "department"]).cumcount()
+
+dma_list    = df["dma"].unique()
+dma_results = {}
+
+print(f"\nRunning Optuna for {len(dma_list)} DMAs")
+print(f"Media channels: {len(FINAL_MEDIA_COLS)}")
+print("="*55)
+
+for dma in dma_list:
+
+    dma_data = (
+        df[df["dma"] == dma]
+        .sort_values("Week_Start")
+        .reset_index(drop=True)
+    )
+
+    # Minimum data check
+    if len(dma_data) < 52:
+        print(f"{dma}: SKIPPED — only {len(dma_data)} weeks")
+        continue
+
+    # Time-based train-test split
+    n_train    = int(len(dma_data) * 0.8)
+    train_data = dma_data.iloc[:n_train].copy()
+    test_data  = dma_data.iloc[n_train:].copy()
+
+    print(f"\n{dma}")
+    print(f"  Train: {len(train_data)} weeks | Test: {len(test_data)} weeks")
+
+    # Build and run study
+    objective = build_objective(train_data, test_data, FINAL_MEDIA_COLS)
+
+    study = optuna.create_study(
+        direction = "maximize",
+        sampler   = optuna.samplers.TPESampler(seed=42)
+    )
+    study.optimize(objective, n_trials=300, show_progress_bar=False)
+
+    best_params = study.best_params
+    best_r2     = study.best_value
+
+    print(f"  Best OOS R²  : {best_r2:.4f}")
+    print(f"  Ridge alpha  : {best_params.get('ridge_alpha', 'N/A'):.3f}")
+
+    # Print adstock type chosen per channel
+    print(f"  Adstock types chosen:")
+    for col in FINAL_MEDIA_COLS:
+        key = f"{col}_adstock_type"
+        if key in best_params:
+            atype = best_params[key]
+            if atype == "geometric":
+                decay = best_params.get(f"{col}_decay", "N/A")
+                print(f"    {col:40s} geometric  decay={decay:.3f}")
+            else:
+                shape = best_params.get(f"{col}_shape", "N/A")
+                scale = best_params.get(f"{col}_scale", "N/A")
+                print(f"    {col:40s} weibull    shape={shape:.3f} scale={scale:.3f}")
+
+    dma_results[dma] = {
+        "best_params": best_params,
+        "best_r2":     best_r2,
+        "n_train":     len(train_data),
+        "n_test":      len(test_data)
+    }
+
+###########################################################
+# RESULTS SUMMARY TABLE
+###########################################################
+
+print("\n" + "="*55)
+print("SUMMARY — OOS R² per DMA")
+print("="*55)
+
+summary = pd.DataFrame([
+    {
+        "dma":         dma,
+        "oos_r2":      round(res["best_r2"], 4),
+        "ridge_alpha": round(res["best_params"].get("ridge_alpha", 0), 3),
+        "train_weeks": res["n_train"],
+        "test_weeks":  res["n_test"],
+        "confidence":  "HIGH"   if res["best_r2"] > 0.70
+                       else "MEDIUM" if res["best_r2"] > 0.50
+                       else "LOW"
+    }
+    for dma, res in dma_results.items()
+]).sort_values("oos_r2", ascending=False)
+
+print(summary.to_string(index=False))
+
+###########################################################
+# EXTRACT ADSTOCK TYPE SUMMARY ACROSS ALL DMAS
+###########################################################
+
+print("\n" + "="*55)
+print("ADSTOCK TYPE — most common choice per channel")
+print("="*55)
+
+adstock_choices = {col: [] for col in FINAL_MEDIA_COLS}
+
+for dma, res in dma_results.items():
+    params = res["best_params"]
+    for col in FINAL_MEDIA_COLS:
+        key = f"{col}_adstock_type"
+        if key in params:
+            adstock_choices[col].append(params[key])
+
+for col, choices in adstock_choices.items():
+    if not choices:
+        continue
+    geo_count     = choices.count("geometric")
+    weibull_count = choices.count("weibull")
+    dominant      = "geometric" if geo_count >= weibull_count else "weibull"
+    print(f"  {col:40s} {dominant:10s} "
+          f"(geo:{geo_count} wei:{weibull_count})")
+
+###########################################################
+# VALIDATE SATURATION BOUNDS
+###########################################################
+
+print("\n" + "="*55)
+print("SATURATION VALIDATION")
+print("="*55)
+
+def validate_saturation(x_transformed, col_name):
+    issues = []
+    if x_transformed.max() > 1.0:
+        issues.append(f"max={x_transformed.max():.3f} > 1.0")
+    if x_transformed.min() < 0:
+        issues.append(f"min={x_transformed.min():.3f} < 0")
+    nonzero = x_transformed[x_transformed > 0]
+    if len(nonzero) > 5:
+        p90 = np.percentile(nonzero, 90)
+        p95 = np.percentile(nonzero, 95)
+        if p95 / (p90 + 1e-8) > 1.5:
+            issues.append(f"weak saturation p90={p90:.3f} p95={p95:.3f}")
+    status = "✓ OK" if not issues else f"⚠ {issues}"
+    print(f"  {col_name:40s} {status}")
+    return len(issues) == 0
+
+
+# Validate using first DMA best params
+first_dma    = list(dma_results.keys())[0]
+first_params = dma_results[first_dma]["best_params"]
+first_data   = df[df["dma"] == first_dma].copy()
+
+for col in FINAL_MEDIA_COLS:
+    if col not in first_data.columns:
+        continue
+
+    series       = first_data[col].fillna(0).values
+    adstock_type = first_params.get(f"{col}_adstock_type", "geometric")
+
+    adstock_p = {}
+    if adstock_type == "geometric":
+        adstock_p["decay"] = first_params.get(f"{col}_decay", 0.5)
+    else:
+        adstock_p["shape"] = first_params.get(f"{col}_shape", 1.0)
+        adstock_p["scale"] = first_params.get(f"{col}_scale", 2.0)
+
+    adstocked   = apply_adstock(series, adstock_type, adstock_p)
+    transformed = hill_transform(
+        adstocked,
+        alpha = first_params.get(f"{col}_alpha", 1.0),
+        k     = first_params.get(f"{col}_k",     100)
+    )
+
+    validate_saturation(transformed, col)
+
+print("\nStep 5 complete ✓")
+print("Next → Ridge regression per DMA with best params")
